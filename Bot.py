@@ -31,62 +31,58 @@ else:
 
 def load_data():
     base = {"keywords": ["今日已完成","對題數"], "checkins": {}, "reminder_channels": {}, "participants": {}, "leaves": {}}
-    # 如果沒有 supabase，走舊的檔案邏輯
     if not supabase:
         if not os.path.exists(DATA_FILE):
             return base
-        with open(DATA_FILE, "r", encoding="utf-8") as f:
-            d = json.load(f)
-            d.setdefault("keywords", ["今日已完成","對題數"])
-            d.setdefault("checkins", {})
-            d.setdefault("reminder_channels", {})
-            d.setdefault("participants", {})
-            d.setdefault("leaves", {})
-        new_checkins = {}
-        for uid, val in d["checkins"].items():
-            if isinstance(val, list):
-                new_checkins[uid] = {date: {"correct": None, "total": 10} for date in val}
-            else:
-                new_checkins[uid] = val
-        d["checkins"] = new_checkins
-        return d
+        try:
+            with open(DATA_FILE, "r", encoding="utf-8") as f:
+                d = json.load(f)
+                d.setdefault("keywords", ["今日已完成","對題數"])
+                d.setdefault("checkins", {})
+                d.setdefault("reminder_channels", {})
+                d.setdefault("participants", {})
+                d.setdefault("leaves", {})
+            new_checkins = {}
+            for uid, val in d["checkins"].items():
+                if isinstance(val, list):
+                    new_checkins[uid] = {date: {"correct": None, "total": 10} for date in val}
+                else:
+                    new_checkins[uid] = val
+            d["checkins"] = new_checkins
+            return d
+        except:
+            return base
 
-    # 有 supabase，從雲端讀
     try:
-        # checkins
         r = supabase.table("checkins").select("*").execute()
         for row in r.data or []:
             uid = str(row["user_id"])
             base["checkins"].setdefault(uid, {})
             base["checkins"][uid][row["date"]] = {"correct": row.get("correct"), "total": row.get("total") if row.get("total") else 10}
-        # leaves
         r = supabase.table("leaves").select("*").execute()
         for row in r.data or []:
             gid = str(row["guild_id"])
             uid = str(row["user_id"])
             base["leaves"].setdefault(gid, {}).setdefault(uid, {})[row["date"]] = row.get("reason") or "有事"
-        # participants
         r = supabase.table("participants").select("*").execute()
         for row in r.data or []:
             gid = str(row["guild_id"])
             base["participants"].setdefault(gid, [])
             if str(row["user_id"]) not in base["participants"][gid]:
                 base["participants"][gid].append(str(row["user_id"]))
-        # reminder_channels
         r = supabase.table("reminder_channels").select("*").execute()
         for row in r.data or []:
             base["reminder_channels"][str(row["guild_id"])] = int(row["channel_id"]) if str(row["channel_id"]).isdigit() else row["channel_id"]
+        print(f"已從 Supabase 載入 {len(base['checkins'])} 人的打卡")
     except Exception as e:
         print(f"讀取 Supabase 失敗: {e}")
     return base
 
 def save_data(data):
-    # 舊版函式保留給相容，現在資料庫版不用寫檔
     if not supabase:
         with open(DATA_FILE, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
 
-# --- DB 操作 ---
 def db_upsert_checkin(uid, username, date_str, correct, total):
     if not supabase:
         return
@@ -114,12 +110,6 @@ def db_add_leaves(gid, uid, dates, reason):
         supabase.table("leaves").upsert(rows, on_conflict="guild_id,user_id,date").execute()
     except Exception as e:
         print(f"add leaves 失敗: {e}")
-
-def db_add_single_leave(gid, uid, date_str, reason):
-    db_add_leaves(gid, uid, [date_str], reason)
-
-def db_delete_single_leave(gid, uid, date_str):
-    db_delete_leave(gid, uid, date_str)
 
 def db_set_participants(gid, uid_list):
     if not supabase:
@@ -223,7 +213,6 @@ async def do_checkin(user, channel, raw_text=None, guild_id=None):
     uid = str(user.id)
     today = today_str()
     data["checkins"].setdefault(uid, {})
-    # 如果今天有請假，先取消請假
     if guild_id and today in get_leaves(guild_id, uid):
         del data["leaves"][str(guild_id)][uid][today]
         db_delete_leave(guild_id, uid, today)
@@ -253,6 +242,7 @@ async def on_message(message):
 
 @bot.tree.command(name="今日戰況", description="查看今天狀況")
 async def today_status(interaction: dc.Interaction):
+    await interaction.response.defer(ephemeral=False)
     today = today_str()
     gid = str(interaction.guild.id)
     members = [interaction.guild.get_member(int(uid)) for uid in get_participant_ids(gid)] if get_participant_ids(gid) else [m for m in interaction.guild.members if not m.bot]
@@ -279,16 +269,17 @@ async def today_status(interaction: dc.Interaction):
     text += f"✅ 已完成 ({len(checked)})\n" + ("\n".join(checked) if checked else "無") + "\n\n"
     text += f"💤 請假中 ({len(on_leave)})\n" + ("\n".join(on_leave) if on_leave else "無") + "\n\n"
     text += f"❌ 未完成 ({len(not_checked)})\n" + ("\n".join(not_checked) if not_checked else "無")
-    await interaction.response.send_message(text)
+    await interaction.followup.send(text)
 
 @bot.tree.command(name="請假", description="請假")
 @app_commands.describe(開始日期="YYYY-MM-DD", 結束日期="YYYY-MM-DD", 理由="請假原因")
-async def leave(interaction: dc.Interaction, 開始日期: str = None, 結束日期: str = None, 理由: str = "有事"):
+async def leave_cmd(interaction: dc.Interaction, 開始日期: str = None, 結束日期: str = None, 理由: str = "有事"):
+    await interaction.response.defer(ephemeral=False)
     try:
         s = datetime.strptime(開始日期, "%Y-%m-%d").date() if 開始日期 else datetime.now(TAIPEI).date()
         e = datetime.strptime(結束日期, "%Y-%m-%d").date() if 結束日期 else s
     except:
-        await interaction.response.send_message("日期格式錯誤", ephemeral=True)
+        await interaction.followup.send("日期格式錯誤", ephemeral=True)
         return
     gid = interaction.guild.id
     uid = str(interaction.user.id)
@@ -299,47 +290,75 @@ async def leave(interaction: dc.Interaction, 開始日期: str = None, 結束日
         cur += timedelta(days=1)
     for d in dates:
         if count_leaves_in_month(gid, uid, d[:7]) >= MONTHLY_LEAVE_LIMIT and d not in get_leaves(gid, uid):
-            await interaction.response.send_message(f"❌ {d[:7]} 已達上限", ephemeral=True)
+            await interaction.followup.send(f"❌ {d[:7]} 已達上限", ephemeral=True)
             return
     data["leaves"].setdefault(str(gid), {}).setdefault(uid, {})
     for d in dates:
         data["leaves"][str(gid)][uid][d] = 理由
     db_add_leaves(gid, uid, dates, 理由)
     save_data(data)
-    await interaction.response.send_message(f"💤 已請假 {開始日期} ~ {結束日期} ({理由})", ephemeral=False)
+    await interaction.followup.send(f"💤 已請假 {開始日期} ~ {結束日期} ({理由})")
+
+@bot.tree.command(name="補打卡", description="補打過去的卡")
+@app_commands.describe(日期="YYYY-MM-DD", 對題數="例如 8/10")
+async def bu_daka(interaction: dc.Interaction, 日期: str, 對題數: str = None):
+    await interaction.response.defer(ephemeral=True)
+    try:
+        target = datetime.strptime(日期, "%Y-%m-%d").date()
+        target_str = target.strftime("%Y-%m-%d")
+    except:
+        await interaction.followup.send("日期格式錯誤，請用 YYYY-MM-DD，例如 2025-10-17", ephemeral=True)
+        return
+    uid = str(interaction.user.id)
+    if target_str in data["checkins"].get(uid, {}):
+        await interaction.followup.send(f"{target_str} 已經打過卡了", ephemeral=True)
+        return
+    c, t = parse_score(對題數)
+    data["checkins"].setdefault(uid, {})[target_str] = {"correct": c, "total": t if t else 10}
+    db_upsert_checkin(uid, str(interaction.user), target_str, c, t if t else 10)
+    save_data(data)
+    # 如果當天有請假，自動取消
+    gid = interaction.guild.id
+    if target_str in get_leaves(gid, uid):
+        del data["leaves"][str(gid)][uid][target_str]
+        db_delete_leave(gid, uid, target_str)
+    await interaction.followup.send(f"✅ 已補打 {target_str} {f'對題數 {對題數}' if 對題數 else ''}", ephemeral=True)
 
 @bot.tree.command(name="幫別人請假", description="管理員幫別人請假")
 @app_commands.describe(成員="要幫誰請", 日期="YYYY-MM-DD", 理由="原因", 強制請假="是否無視上限")
 @app_commands.checks.has_permissions(manage_guild=True)
 async def leave_for_other(interaction: dc.Interaction, 成員: dc.Member, 日期: str = None, 理由: str = "有事", 強制請假: bool = False):
+    await interaction.response.defer(ephemeral=True)
     target = 日期 if 日期 else today_str()
     gid = interaction.guild.id
     uid = str(成員.id)
     ym = target[:7]
     if not 強制請假 and count_leaves_in_month(gid, uid, ym) >= MONTHLY_LEAVE_LIMIT:
-        await interaction.response.send_message(f"❌ {成員.display_name} {ym} 已達上限，要強制請把 強制請假 選 是", ephemeral=True)
+        await interaction.followup.send(f"❌ {成員.display_name} {ym} 已達上限，要強制請把 強制請假 選 是", ephemeral=True)
         return
     data["leaves"].setdefault(str(gid), {}).setdefault(uid, {})[target] = 理由
-    db_add_single_leave(gid, uid, target, 理由)
+    db_add_leaves(gid, uid, [target], 理由)
     save_data(data)
-    await interaction.response.send_message(f"✅ 已幫 {成員.display_name} 請假 {target} ({理由})", ephemeral=True)
+    await interaction.followup.send(f"✅ 已幫 {成員.display_name} 請假 {target} ({理由})", ephemeral=True)
 
 @bot.tree.command(name="取消請假", description="取消請假")
 @app_commands.describe(日期="YYYY-MM-DD")
 async def cancel_leave(interaction: dc.Interaction, 日期: str = None):
+    await interaction.response.defer(ephemeral=True)
     target = 日期 if 日期 else today_str()
     gid = str(interaction.guild.id)
     uid = str(interaction.user.id)
     if target in data.get("leaves", {}).get(gid, {}).get(uid, {}):
         del data["leaves"][gid][uid][target]
-        db_delete_single_leave(gid, uid, target)
+        db_delete_leave(gid, uid, target)
         save_data(data)
-        await interaction.response.send_message(f"✅ 已取消 {target}", ephemeral=True)
+        await interaction.followup.send(f"✅ 已取消 {target}", ephemeral=True)
     else:
-        await interaction.response.send_message("那天沒請假", ephemeral=True)
+        await interaction.followup.send("那天沒請假", ephemeral=True)
 
 @bot.tree.command(name="查看請假", description="查看請假")
 async def view_leaves(interaction: dc.Interaction):
+    await interaction.response.defer(ephemeral=True)
     gid = str(interaction.guild.id)
     today = today_str()
     all_l = data.get("leaves", {}).get(gid, {})
@@ -351,7 +370,7 @@ async def view_leaves(interaction: dc.Interaction):
                 name = m.display_name if m else uid
                 lines.append(f"{name} - {d}：{r}")
     msg = "\n".join(lines) if lines else "沒有未來的請假"
-    await interaction.response.send_message(msg, ephemeral=True)
+    await interaction.followup.send(msg, ephemeral=True)
 
 @bot.tree.command(name="打卡", description="打卡")
 async def checkin_slash(interaction: dc.Interaction):
@@ -361,15 +380,17 @@ async def checkin_slash(interaction: dc.Interaction):
 
 @bot.tree.command(name="我的連勝", description="查看連勝")
 async def my_streak(interaction: dc.Interaction):
+    await interaction.response.defer(ephemeral=True)
     uid = str(interaction.user.id)
     gid = interaction.guild.id
     keys = list(data["checkins"].get(uid, {}).keys())
     leaves = get_leave_set(gid, uid)
     ym = today_str()[:7]
-    await interaction.response.send_message(f"{interaction.user.mention} 連勝 {calc_streak(keys, leaves)} 天 / 最高 {calc_max_streak(keys, leaves)} 天 / 本月請假 {count_leaves_in_month(gid, uid, ym)}/{MONTHLY_LEAVE_LIMIT}")
+    await interaction.followup.send(f"{interaction.user.mention} 連勝 {calc_streak(keys, leaves)} 天 / 最高 {calc_max_streak(keys, leaves)} 天 / 本月請假 {count_leaves_in_month(gid, uid, ym)}/{MONTHLY_LEAVE_LIMIT}", ephemeral=True)
 
 @bot.tree.command(name="排行榜", description="排行榜")
 async def leaderboard(interaction: dc.Interaction):
+    await interaction.response.defer(ephemeral=False)
     gid = str(interaction.guild.id)
     members = [interaction.guild.get_member(int(uid)) for uid in get_participant_ids(gid)] if get_participant_ids(gid) else [m for m in interaction.guild.members if not m.bot]
     ranking = []
@@ -382,12 +403,13 @@ async def leaderboard(interaction: dc.Interaction):
             ranking.append((m.display_name, calc_streak(keys, get_leave_set(gid, uid)), len(keys)))
     ranking.sort(key=lambda x: (x[1], x[2]), reverse=True)
     desc = "\n".join([f"{i}. {n} - 連勝 {s}天 / 累計 {t}天" for i, (n, s, t) in enumerate(ranking[:10], 1)]) if ranking else "無紀錄"
-    await interaction.response.send_message(embed=dc.Embed(title="🏆 排行榜", description=desc, color=0xffd700))
+    await interaction.followup.send(embed=dc.Embed(title="🏆 排行榜", description=desc, color=0xffd700))
 
 @bot.tree.command(name="新增參加者", description="加入提醒名單")
 @app_commands.describe(成員1="第1位", 成員2="第2位")
 @app_commands.checks.has_permissions(manage_guild=True)
 async def add_part(interaction: dc.Interaction, 成員1: dc.Member, 成員2: dc.Member = None):
+    await interaction.response.defer(ephemeral=True)
     gid = str(interaction.guild.id)
     data["participants"].setdefault(gid, [])
     new_ids = []
@@ -398,15 +420,16 @@ async def add_part(interaction: dc.Interaction, 成員1: dc.Member, 成員2: dc.
     if new_ids:
         db_set_participants(gid, new_ids)
     save_data(data)
-    await interaction.response.send_message("✅ 已更新參加名單", ephemeral=True)
+    await interaction.followup.send("✅ 已更新參加名單", ephemeral=True)
 
 @bot.tree.command(name="設定提醒頻道", description="設定23:00提醒頻道")
 @app_commands.checks.has_permissions(manage_guild=True)
 async def set_ch(interaction: dc.Interaction):
+    await interaction.response.defer(ephemeral=True)
     data["reminder_channels"][str(interaction.guild.id)] = interaction.channel.id
     db_set_reminder_channel(interaction.guild.id, interaction.channel.id)
     save_data(data)
-    await interaction.response.send_message("✅ 已設定", ephemeral=True)
+    await interaction.followup.send("✅ 已設定", ephemeral=True)
 
 @tasks.loop(time=dt_time(hour=23, minute=0, tzinfo=TAIPEI))
 async def daily_reminder():
