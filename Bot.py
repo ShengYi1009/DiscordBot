@@ -8,34 +8,139 @@ import discord as dc
 from discord.ext import commands, tasks
 from discord import app_commands
 from flask import Flask
-import threading, os
+import threading
 
 TAIPEI = timezone(timedelta(hours=8))
 DATA_FILE = "checkins.json"
 MONTHLY_LEAVE_LIMIT = 1
 
+# --- Supabase ---
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+supabase = None
+if SUPABASE_URL and SUPABASE_KEY:
+    try:
+        from supabase import create_client
+        supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+        print("Supabase 已連線")
+    except Exception as e:
+        print(f"Supabase 連線失敗，改用本地檔案: {e}")
+        supabase = None
+else:
+    print("未設定 SUPABASE_URL / KEY，改用本地檔案")
+
 def load_data():
-    if not os.path.exists(DATA_FILE):
-        return {"keywords": ["今日已完成","對題數"], "checkins": {}, "reminder_channels": {}, "participants": {}, "leaves": {}}
-    with open(DATA_FILE, "r", encoding="utf-8") as f:
-        d = json.load(f)
-        d.setdefault("keywords", ["今日已完成","對題數"])
-        d.setdefault("checkins", {})
-        d.setdefault("reminder_channels", {})
-        d.setdefault("participants", {})
-        d.setdefault("leaves", {})
-    new_checkins = {}
-    for uid, val in d["checkins"].items():
-        if isinstance(val, list):
-            new_checkins[uid] = {date: {"correct": None, "total": 10} for date in val}
-        else:
-            new_checkins[uid] = val
-    d["checkins"] = new_checkins
-    return d
+    base = {"keywords": ["今日已完成","對題數"], "checkins": {}, "reminder_channels": {}, "participants": {}, "leaves": {}}
+    # 如果沒有 supabase，走舊的檔案邏輯
+    if not supabase:
+        if not os.path.exists(DATA_FILE):
+            return base
+        with open(DATA_FILE, "r", encoding="utf-8") as f:
+            d = json.load(f)
+            d.setdefault("keywords", ["今日已完成","對題數"])
+            d.setdefault("checkins", {})
+            d.setdefault("reminder_channels", {})
+            d.setdefault("participants", {})
+            d.setdefault("leaves", {})
+        new_checkins = {}
+        for uid, val in d["checkins"].items():
+            if isinstance(val, list):
+                new_checkins[uid] = {date: {"correct": None, "total": 10} for date in val}
+            else:
+                new_checkins[uid] = val
+        d["checkins"] = new_checkins
+        return d
+
+    # 有 supabase，從雲端讀
+    try:
+        # checkins
+        r = supabase.table("checkins").select("*").execute()
+        for row in r.data or []:
+            uid = str(row["user_id"])
+            base["checkins"].setdefault(uid, {})
+            base["checkins"][uid][row["date"]] = {"correct": row.get("correct"), "total": row.get("total") if row.get("total") else 10}
+        # leaves
+        r = supabase.table("leaves").select("*").execute()
+        for row in r.data or []:
+            gid = str(row["guild_id"])
+            uid = str(row["user_id"])
+            base["leaves"].setdefault(gid, {}).setdefault(uid, {})[row["date"]] = row.get("reason") or "有事"
+        # participants
+        r = supabase.table("participants").select("*").execute()
+        for row in r.data or []:
+            gid = str(row["guild_id"])
+            base["participants"].setdefault(gid, [])
+            if str(row["user_id"]) not in base["participants"][gid]:
+                base["participants"][gid].append(str(row["user_id"]))
+        # reminder_channels
+        r = supabase.table("reminder_channels").select("*").execute()
+        for row in r.data or []:
+            base["reminder_channels"][str(row["guild_id"])] = int(row["channel_id"]) if str(row["channel_id"]).isdigit() else row["channel_id"]
+    except Exception as e:
+        print(f"讀取 Supabase 失敗: {e}")
+    return base
 
 def save_data(data):
-    with open(DATA_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+    # 舊版函式保留給相容，現在資料庫版不用寫檔
+    if not supabase:
+        with open(DATA_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+
+# --- DB 操作 ---
+def db_upsert_checkin(uid, username, date_str, correct, total):
+    if not supabase:
+        return
+    try:
+        supabase.table("checkins").upsert(
+            {"user_id": str(uid), "username": str(username), "date": date_str, "correct": correct, "total": total},
+            on_conflict="user_id,date"
+        ).execute()
+    except Exception as e:
+        print(f"upsert checkin 失敗: {e}")
+
+def db_delete_leave(gid, uid, date_str):
+    if not supabase:
+        return
+    try:
+        supabase.table("leaves").delete().eq("guild_id", str(gid)).eq("user_id", str(uid)).eq("date", date_str).execute()
+    except Exception as e:
+        print(f"delete leave 失敗: {e}")
+
+def db_add_leaves(gid, uid, dates, reason):
+    if not supabase:
+        return
+    try:
+        rows = [{"guild_id": str(gid), "user_id": str(uid), "date": d, "reason": reason} for d in dates]
+        supabase.table("leaves").upsert(rows, on_conflict="guild_id,user_id,date").execute()
+    except Exception as e:
+        print(f"add leaves 失敗: {e}")
+
+def db_add_single_leave(gid, uid, date_str, reason):
+    db_add_leaves(gid, uid, [date_str], reason)
+
+def db_delete_single_leave(gid, uid, date_str):
+    db_delete_leave(gid, uid, date_str)
+
+def db_set_participants(gid, uid_list):
+    if not supabase:
+        return
+    try:
+        rows = [{"guild_id": str(gid), "user_id": str(uid)} for uid in uid_list]
+        if rows:
+            supabase.table("participants").upsert(rows, on_conflict="guild_id,user_id").execute()
+    except Exception as e:
+        print(f"set participants 失敗: {e}")
+
+def db_set_reminder_channel(gid, ch_id):
+    if not supabase:
+        return
+    try:
+        supabase.table("reminder_channels").upsert(
+            {"guild_id": str(gid), "channel_id": str(ch_id)},
+            on_conflict="guild_id"
+        ).execute()
+    except Exception as e:
+        print(f"set reminder 失敗: {e}")
 
 def today_str():
     return datetime.now(TAIPEI).strftime("%Y-%m-%d")
@@ -118,13 +223,16 @@ async def do_checkin(user, channel, raw_text=None, guild_id=None):
     uid = str(user.id)
     today = today_str()
     data["checkins"].setdefault(uid, {})
+    # 如果今天有請假，先取消請假
     if guild_id and today in get_leaves(guild_id, uid):
         del data["leaves"][str(guild_id)][uid][today]
+        db_delete_leave(guild_id, uid, today)
     if today in data["checkins"][uid]:
         await channel.send(embed=dc.Embed(title="你今天已經打卡過啦", color=0xffd700))
         return False
     c, t = parse_score(raw_text)
     data["checkins"][uid][today] = {"correct": c, "total": t if t else 10}
+    db_upsert_checkin(uid, str(user), today, c, t if t else 10)
     save_data(data)
     leaves = get_leave_set(guild_id, uid) if guild_id else set()
     streak = calc_streak(data["checkins"][uid].keys(), leaves)
@@ -170,34 +278,15 @@ async def today_status(interaction: dc.Interaction):
     text = f"📊 今日戰況 ({today})\n"
     text += f"✅ 已完成 ({len(checked)})\n" + ("\n".join(checked) if checked else "無") + "\n\n"
     text += f"💤 請假中 ({len(on_leave)})\n" + ("\n".join(on_leave) if on_leave else "無") + "\n\n"
-    text += f"❌ 未完成 ({len(not_checked)})\n" + ("\n".join(not_checked) if not_checked else "全員完成！")
+    text += f"❌ 未完成 ({len(not_checked)})\n" + ("\n".join(not_checked) if not_checked else "無")
     await interaction.response.send_message(text)
 
-@bot.tree.command(name="請假", description="請假一天，每月限1次")
-@app_commands.describe(日期="YYYY-MM-DD 預設今天", 理由="原因")
-async def leave_one(interaction: dc.Interaction, 日期: str = None, 理由: str = "有事"):
-    target = 日期 if 日期 else today_str()
+@bot.tree.command(name="請假", description="請假")
+@app_commands.describe(開始日期="YYYY-MM-DD", 結束日期="YYYY-MM-DD", 理由="請假原因")
+async def leave(interaction: dc.Interaction, 開始日期: str = None, 結束日期: str = None, 理由: str = "有事"):
     try:
-        datetime.strptime(target, "%Y-%m-%d")
-    except:
-        await interaction.response.send_message("日期格式用 YYYY-MM-DD", ephemeral=True)
-        return
-    gid = interaction.guild.id
-    uid = str(interaction.user.id)
-    ym = target[:7]
-    if count_leaves_in_month(gid, uid, ym) >= MONTHLY_LEAVE_LIMIT:
-        await interaction.response.send_message(f"❌ 你 {ym} 已經請過 {MONTHLY_LEAVE_LIMIT} 次了", ephemeral=True)
-        return
-    data["leaves"].setdefault(str(gid), {}).setdefault(uid, {})[target] = 理由
-    save_data(data)
-    await interaction.response.send_message(f"💤 {interaction.user.mention} 已請假 {target} ({理由})", ephemeral=False)
-
-@bot.tree.command(name="請假多日", description="一次請多天")
-@app_commands.describe(開始日期="YYYY-MM-DD", 結束日期="YYYY-MM-DD", 理由="原因")
-async def leave_range(interaction: dc.Interaction, 開始日期: str, 結束日期: str, 理由: str = "有事"):
-    try:
-        s = datetime.strptime(開始日期, "%Y-%m-%d").date()
-        e = datetime.strptime(結束日期, "%Y-%m-%d").date()
+        s = datetime.strptime(開始日期, "%Y-%m-%d").date() if 開始日期 else datetime.now(TAIPEI).date()
+        e = datetime.strptime(結束日期, "%Y-%m-%d").date() if 結束日期 else s
     except:
         await interaction.response.send_message("日期格式錯誤", ephemeral=True)
         return
@@ -215,6 +304,7 @@ async def leave_range(interaction: dc.Interaction, 開始日期: str, 結束日�
     data["leaves"].setdefault(str(gid), {}).setdefault(uid, {})
     for d in dates:
         data["leaves"][str(gid)][uid][d] = 理由
+    db_add_leaves(gid, uid, dates, 理由)
     save_data(data)
     await interaction.response.send_message(f"💤 已請假 {開始日期} ~ {結束日期} ({理由})", ephemeral=False)
 
@@ -230,6 +320,7 @@ async def leave_for_other(interaction: dc.Interaction, 成員: dc.Member, 日期
         await interaction.response.send_message(f"❌ {成員.display_name} {ym} 已達上限，要強制請把 強制請假 選 是", ephemeral=True)
         return
     data["leaves"].setdefault(str(gid), {}).setdefault(uid, {})[target] = 理由
+    db_add_single_leave(gid, uid, target, 理由)
     save_data(data)
     await interaction.response.send_message(f"✅ 已幫 {成員.display_name} 請假 {target} ({理由})", ephemeral=True)
 
@@ -241,6 +332,7 @@ async def cancel_leave(interaction: dc.Interaction, 日期: str = None):
     uid = str(interaction.user.id)
     if target in data.get("leaves", {}).get(gid, {}).get(uid, {}):
         del data["leaves"][gid][uid][target]
+        db_delete_single_leave(gid, uid, target)
         save_data(data)
         await interaction.response.send_message(f"✅ 已取消 {target}", ephemeral=True)
     else:
@@ -298,9 +390,13 @@ async def leaderboard(interaction: dc.Interaction):
 async def add_part(interaction: dc.Interaction, 成員1: dc.Member, 成員2: dc.Member = None):
     gid = str(interaction.guild.id)
     data["participants"].setdefault(gid, [])
+    new_ids = []
     for m in [成員1, 成員2]:
         if m and str(m.id) not in data["participants"][gid]:
             data["participants"][gid].append(str(m.id))
+            new_ids.append(str(m.id))
+    if new_ids:
+        db_set_participants(gid, new_ids)
     save_data(data)
     await interaction.response.send_message("✅ 已更新參加名單", ephemeral=True)
 
@@ -308,6 +404,7 @@ async def add_part(interaction: dc.Interaction, 成員1: dc.Member, 成員2: dc.
 @app_commands.checks.has_permissions(manage_guild=True)
 async def set_ch(interaction: dc.Interaction):
     data["reminder_channels"][str(interaction.guild.id)] = interaction.channel.id
+    db_set_reminder_channel(interaction.guild.id, interaction.channel.id)
     save_data(data)
     await interaction.response.send_message("✅ 已設定", ephemeral=True)
 
