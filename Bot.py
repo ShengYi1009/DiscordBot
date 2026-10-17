@@ -330,6 +330,31 @@ async def bu_daka(interaction: dc.Interaction, 日期: str, 對題數: str = Non
         db_delete_leave(gid, uid, target_str)
     await interaction.followup.send(f"✅ 已補打 {target_str} {f'對題數 {對題數}' if 對題數 else ''}", ephemeral=True)
 
+@bot.tree.command(name="幫別人補打卡", description="管理員幫別人補打卡")
+@app_commands.describe(成員="要幫誰補", 日期="YYYY-MM-DD", 對題數="例如 8/10 或 8", 強制覆蓋="如果那天已經有紀錄是否覆蓋")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def bu_daka_for_other(interaction: dc.Interaction, 成員: dc.Member, 日期: str, 對題數: str = None, 強制覆蓋: bool = False):
+    await interaction.response.defer(ephemeral=True)
+    try:
+        target = datetime.strptime(日期, "%Y-%m-%d").date()
+        target_str = target.strftime("%Y-%m-%d")
+    except:
+        await interaction.followup.send("日期格式錯誤，請用 YYYY-MM-DD", ephemeral=True)
+        return
+    uid = str(成員.id)
+    if not 強制覆蓋 and target_str in data["checkins"].get(uid, {}):
+        await interaction.followup.send(f"❌ {成員.display_name} 在 {target_str} 已經有紀錄了，要覆蓋請把 強制覆蓋 選 是", ephemeral=True)
+        return
+    c, t = parse_score(對題數)
+    data["checkins"].setdefault(uid, {})[target_str] = {"correct": c, "total": t if t else 10}
+    db_upsert_checkin(uid, str(成員), target_str, c, t if t else 10)
+    save_data(data)
+    gid = interaction.guild.id
+    if target_str in data.get("leaves", {}).get(str(gid), {}).get(uid, {}):
+        del data["leaves"][str(gid)][uid][target_str]
+        db_delete_leave(gid, uid, target_str)
+    await interaction.followup.send(f"✅ 已幫 {成員.display_name} 補打 {target_str} {f'對題數 {對題數}' if 對題數 else ''}", ephemeral=True)
+
 @bot.tree.command(name="幫別人請假", description="管理員幫別人請假")
 @app_commands.describe(成員="要幫誰請", 日期="YYYY-MM-DD", 理由="原因", 強制請假="是否無視上限")
 @app_commands.checks.has_permissions(manage_guild=True)
@@ -437,18 +462,14 @@ async def set_ch(interaction: dc.Interaction):
     save_data(data)
     await interaction.followup.send("✅ 已設定", ephemeral=True)
 
-# ========== 新增：管理員查看打卡紀錄 ==========
 @bot.tree.command(name="查看打卡紀錄", description="管理員功能：查看歷史打卡紀錄")
 @app_commands.describe(成員="指定要查誰，不選就是查全部", 開始日期="YYYY-MM-DD，預設30天前", 結束日期="YYYY-MM-DD，預設今天", 月份="YYYY-MM 快捷查詢某個月，例如 2025-10")
 @app_commands.checks.has_permissions(manage_guild=True)
 async def view_history(interaction: dc.Interaction, 成員: dc.Member = None, 開始日期: str = None, 結束日期: str = None, 月份: str = None):
     await interaction.response.defer(ephemeral=True)
-    
-    # 處理月份快捷
     if 月份:
         try:
             ym = datetime.strptime(月份, "%Y-%m").date()
-            # 當月第一天到最後一天
             start_date = ym.replace(day=1)
             if ym.month == 12:
                 end_date = ym.replace(year=ym.year+1, month=1, day=1) - timedelta(days=1)
@@ -470,27 +491,20 @@ async def view_history(interaction: dc.Interaction, 成員: dc.Member = None, �
         except:
             await interaction.followup.send("日期格式錯誤，請用 YYYY-MM-DD", ephemeral=True)
             return
-
     if start_date > end_date:
         start_date, end_date = end_date, start_date
-
     start_str = start_date.strftime("%Y-%m-%d")
     end_str = end_date.strftime("%Y-%m-%d")
-    gid = str(interaction.guild.id)
-
-    # 直接查 Supabase 最新資料
     records = []
     if supabase:
         try:
-            q = supabase.table("checkins").select("*").gte("date", start_str).lte("date", end_str).order("date", desc=True).limit(200)
+            q = supabase.table("checkins").select("*").gte("date", start_str).lte("date", end_str).order("date", desc=True).limit(500)
             if 成員:
                 q = q.eq("user_id", str(成員.id))
             res = q.execute()
             records = res.data or []
         except Exception as e:
             print(f"查詢歷史失敗: {e}")
-
-    # 如果 Supabase 查不到，fallback 到記憶體資料
     if not records:
         target_uids = [str(成員.id)] if 成員 else list(data["checkins"].keys())
         for uid in target_uids:
@@ -499,49 +513,36 @@ async def view_history(interaction: dc.Interaction, 成員: dc.Member = None, �
                     m = interaction.guild.get_member(int(uid))
                     records.append({
                         "user_id": uid,
-                        "username": m.display_name if m else uid,
+                        "username": m.display_name if m else rec.get("username") or uid,
                         "date": d_str,
                         "correct": rec.get("correct"),
                         "total": rec.get("total", 10)
                     })
         records.sort(key=lambda x: x["date"], reverse=True)
-
     if not records:
-        await interaction.followup.send(f"📭 {start_str} ~ {end_str} 沒有打卡紀錄", ephemeral=True)
+        who = f"{成員.display_name} 在 " if 成員 else ""
+        await interaction.followup.send(f"📭 {who}{start_str} ~ {end_str} 沒有打卡紀錄\n提示：如果要查別人，要用 `/幫別人補打卡`，一般的 `/補打卡` 只能補自己", ephemeral=True)
         return
-
-    # 統計
     total_days = len(records)
-    # 依人分組
     from collections import defaultdict
     by_user = defaultdict(list)
     for r in records:
         by_user[r["username"]].append(r)
-
-    # 組訊息，Discord 2000字限制，分段
     embed = dc.Embed(title=f"📜 打卡紀錄 {start_str} ~ {end_str}", color=0x5865F2)
     embed.set_footer(text=f"共 {total_days} 筆 | {'單人：' + 成員.display_name if 成員 else f'共 {len(by_user)} 人'}")
-
-    # 摘要
     summary_lines = []
     for uname, recs in sorted(by_user.items()):
         dates = sorted([r["date"] for r in recs])
-        # 計算平均答對率
         scores = [r for r in recs if r.get("correct") is not None]
         if scores:
             avg = sum(r["correct"] for r in scores) / len(scores)
             summary_lines.append(f"**{uname}**：{len(recs)}天，平均 {avg:.1f}題 ({dates[0]}~{dates[-1]})")
         else:
             summary_lines.append(f"**{uname}**：{len(recs)}天 ({dates[0]}~{dates[-1]})")
-    
-    # 太長就截斷
     summary_text = "\n".join(summary_lines[:20])
     if len(by_user) > 20:
         summary_text += f"\n...還有 {len(by_user)-20} 人"
-    
     embed.description = summary_text
-
-    # 詳細清單用檔案方式附上，避免洗版
     detail_lines = []
     for r in sorted(records, key=lambda x: (x["username"], x["date"])):
         c = r.get("correct")
@@ -550,13 +551,10 @@ async def view_history(interaction: dc.Interaction, 成員: dc.Member = None, �
             detail_lines.append(f"{r['date']} | {r['username']} | {c}/{t}")
         else:
             detail_lines.append(f"{r['date']} | {r['username']} | 已打卡")
-
-    # 如果紀錄少，直接加在 embed
     if total_days <= 25:
         embed.add_field(name="詳細", value="\n".join(detail_lines[:25])[:1024], inline=False)
         await interaction.followup.send(embed=embed, ephemeral=True)
     else:
-        # 太多就產生文字檔
         import io
         txt = "\n".join(detail_lines)
         file = dc.File(io.BytesIO(txt.encode('utf-8')), filename=f"checkin_{start_str}_{end_str}.txt")
