@@ -7,6 +7,8 @@ from datetime import datetime, timezone, timedelta, time as dt_time
 import discord as dc
 from discord.ext import commands, tasks
 from discord import app_commands
+from flask import Flask
+import threading, os
 
 TAIPEI = timezone(timedelta(hours=8))
 DATA_FILE = "checkins.json"
@@ -326,5 +328,15 @@ async def daily_reminder():
             await ch.send(f"⏰ 還沒打卡：{' '.join(not_checked)}")
         else:
             await ch.send("🎉 全員完成！")
+
+app = Flask(__name__)
+@app.route('/')
+def home():
+    return "Bot is alive!"
+
+def run_web():
+    app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 10000)))
+
+threading.Thread(target=run_web).start()
 
 bot.run(os.getenv("DISCORD_TOKEN"))
