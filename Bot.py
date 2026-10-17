@@ -14,7 +14,6 @@ TAIPEI = timezone(timedelta(hours=8))
 DATA_FILE = "checkins.json"
 MONTHLY_LEAVE_LIMIT = 1
 
-# --- Supabase ---
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 supabase = None
@@ -52,7 +51,6 @@ def load_data():
             return d
         except:
             return base
-
     try:
         r = supabase.table("checkins").select("*").execute()
         for row in r.data or []:
@@ -136,11 +134,22 @@ def today_str():
     return datetime.now(TAIPEI).strftime("%Y-%m-%d")
 
 def parse_score(text):
-    if not text:
+    # 修復：不管傳進來是 int 還是 str 都能處理
+    if text is None:
+        return None, None
+    if isinstance(text, int):
+        return text, 10
+    if not isinstance(text, str):
+        text = str(text)
+    if not text.strip():
         return None, None
     m = re.findall(r"(\d+)\s*/\s*(\d+)", text)
     if m:
         return int(m[-1][0]), int(m[-1][1])
+    # 如果只打一個數字，例如 "8"，當作答對 8 題
+    m2 = re.findall(r"(\d+)", text)
+    if m2:
+        return int(m2[-1]), 10
     return None, None
 
 def get_leaves(gid, uid):
@@ -300,7 +309,7 @@ async def leave_cmd(interaction: dc.Interaction, 開始日期: str = None, 結�
     await interaction.followup.send(f"💤 已請假 {開始日期} ~ {結束日期} ({理由})")
 
 @bot.tree.command(name="補打卡", description="補打過去的卡")
-@app_commands.describe(日期="YYYY-MM-DD", 對題數="例如 8/10")
+@app_commands.describe(日期="YYYY-MM-DD", 對題數="例如 8/10 或 8")
 async def bu_daka(interaction: dc.Interaction, 日期: str, 對題數: str = None):
     await interaction.response.defer(ephemeral=True)
     try:
@@ -317,7 +326,6 @@ async def bu_daka(interaction: dc.Interaction, 日期: str, 對題數: str = Non
     data["checkins"].setdefault(uid, {})[target_str] = {"correct": c, "total": t if t else 10}
     db_upsert_checkin(uid, str(interaction.user), target_str, c, t if t else 10)
     save_data(data)
-    # 如果當天有請假，自動取消
     gid = interaction.guild.id
     if target_str in get_leaves(gid, uid):
         del data["leaves"][str(gid)][uid][target_str]
